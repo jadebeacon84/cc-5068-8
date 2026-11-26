@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>录音 {{ recording_id }} - 声音事件</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <h1>本地声音事件识别原型</h1>
+    <div id="health" class="health">检查本地链路状态…</div>
+  </header>
+  <main class="layout">
+    <aside class="sidebar">
+      <h2>录音列表</h2>
+      <div class="hint">按录音划分，文件夹名不参与分类</div>
+      <ul id="recording-list" class="recording-list"></ul>
+      <h2>失败反馈</h2>
+      <div id="feedback-summary" class="hint">—</div>
+      <ul id="feedback-list" class="feedback-list"></ul>
+    </aside>
+    <section class="content" id="content">
+      <div class="empty-state"><p>正在加载录音…</p></div>
+    </section>
+  </main>
+  <script>
+    window.TARGET_CLASSES = {{ target_classes | tojson }};
+    window.PRESELECTED_RECORDING = {{ recording_id | tojson }};
+  </script>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
