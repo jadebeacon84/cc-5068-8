@@ -16,6 +16,7 @@ import numpy as np
 from .audio import load_wav
 from .config import AudioConfig, TARGET_CLASSES, UNKNOWN_CLASS
 from .features import Standardizer, extract_windows, frame_times, log_mel_spectrogram, mel_filterbank
+from .labeling import is_trainable_event
 
 
 @dataclass
@@ -38,6 +39,10 @@ class Recording:
 
     def target_events(self) -> list[dict]:
         return [e for e in self.labels["events"] if e["class"] in TARGET_CLASSES]
+
+    def trainable_events(self) -> list[dict]:
+        """Intervals allowed into single-class training packs."""
+        return [e for e in self.labels["events"] if is_trainable_event(e)]
 
     def unknown_events(self) -> list[dict]:
         return [e for e in self.labels["events"] if e["class"] == UNKNOWN_CLASS]
@@ -62,16 +67,22 @@ def assert_no_leakage(manifest: dict[str, list[str]]) -> None:
 
 
 def label_windows(events: list[dict], window_times: np.ndarray,
-                  cfg: AudioConfig) -> np.ndarray:
+                  cfg: AudioConfig, audited_only: bool = True) -> np.ndarray:
     """Multi-label each analysis window from ground-truth event spans.
 
     A window is positive for a class when a matching event overlaps it by at
-    least `min_label_overlap` seconds. Unknown and background-only windows stay
-    all-zero so the classifier can learn to reject them.
+    least `min_label_overlap` seconds. By default only listening-audited
+    intervals with their dry source track in place contribute: pending and
+    unclaimed intervals cannot enter a single-class training pack. Unknown and
+    background-only windows stay all-zero so the classifier learns rejection.
+    Set ``audited_only=False`` when every target span is needed (evaluation
+    adjudication against the full ground truth).
     """
     labels = np.zeros((len(window_times), len(TARGET_CLASSES)), dtype=np.int8)
     for ev in events:
         if ev["class"] not in TARGET_CLASSES:
+            continue
+        if audited_only and not is_trainable_event(ev):
             continue
         cls_idx = TARGET_CLASSES.index(ev["class"])
         for i, w_start in enumerate(window_times):

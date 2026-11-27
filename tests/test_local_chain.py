@@ -68,7 +68,7 @@ def test_background_is_not_equated_with_target(trained_pipeline):
             assert not any(i in e.windows and len(e.windows) == 1
                            for e in result["events"])
     for ev in result["events"]:
-        assert ev.cls in ("knock", "bell", "machine")
+        assert ev.cls in ("knock", "bell", "chime", "machine")
         assert ev.source_match in ("exact", "count_only", "none")
 
 

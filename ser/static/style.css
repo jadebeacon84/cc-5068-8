@@ -106,3 +106,7 @@ canvas { width: 100%; display: block; }
   font-size: 11px;
 }
 select.relabel { font-size: 12px; }
+.annotation-held { background: #fff4e6; }
+.annotation-held td { color: #8a4b08; }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+#annotation-body button { white-space: nowrap; }

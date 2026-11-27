@@ -18,7 +18,7 @@ from flask import (
     send_file,
 )
 
-from .config import CUESHEET_PATH, DATA_ROOT, FEEDBACK_PATH, TARGET_CLASSES
+from .config import FEEDBACK_PATH, TARGET_CLASSES
 from .events import dicts_to_events
 from .feedback import append_feedback, feedback_summary, read_feedback
 from .pipeline import Pipeline
@@ -94,8 +94,35 @@ def api_inference(recording_id: str):
         "thresholds": result["thresholds"].round(4).tolist(),
         "frame_probs_shape": list(result["frame_probs"].shape),
         "events": [e.to_dict() for e in result["events"]],
+        "annotations": result["annotations"],
+        "legacy_annotations": result["legacy_annotations"],
         "cue_entries": pipeline.cue_sheet.entries.get(recording_id, []),
     })
+
+
+@app.route("/api/recordings/<recording_id>/audit", methods=["POST"])
+def api_audit(recording_id: str):
+    """Persist the listening-review verdict for a ground-truth interval."""
+    body = request.get_json(force=True)
+    try:
+        row = pipeline.audit_event(
+            recording_id, body["event_id"], body["status"],
+            body.get("note"),
+        )
+    except KeyError:
+        abort(404)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"annotation": row,
+                    "summary": pipeline.annotation_summary(recording_id)})
+
+
+@app.route("/api/recordings/<recording_id>/annotations")
+def api_annotations(recording_id: str):
+    try:
+        return jsonify(pipeline.annotation_summary(recording_id))
+    except KeyError:
+        abort(404)
 
 
 @app.route("/api/recordings/<recording_id>/evidence/<int:window_index>")
@@ -238,12 +265,14 @@ def api_feedback():
 
 @app.route("/api/health")
 def api_health():
-    ready = (DATA_ROOT / "manifest.json").exists() and pipeline.model_dir.exists()
+    ready = ((pipeline.data_root / "manifest.json").exists()
+             and pipeline.model_dir.exists())
     return jsonify({
         "ready": ready,
-        "data_root": str(DATA_ROOT),
+        "data_root": str(pipeline.data_root),
         "model_dir": str(pipeline.model_dir),
-        "cue_sheet": str(CUESHEET_PATH),
+        "cue_sheet": str(pipeline.cue_sheet.path),
+        "target_classes": list(TARGET_CLASSES),
         "remote_calls": "none - full local processing chain",
     })
 

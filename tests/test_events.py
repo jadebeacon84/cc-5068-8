@@ -31,7 +31,7 @@ def test_assemble_merges_cross_window_event(trained_pipeline, data_dir):
         # one interval even when supported by multiple overlapping windows
         if len(ev.windows) > 1:
             assert ev.end > ev.start
-            assert ev.cls in ("knock", "bell", "machine")
+            assert ev.cls in ("knock", "bell", "chime", "machine")
 
 
 def test_below_threshold_windows_are_rejected(trained_pipeline):

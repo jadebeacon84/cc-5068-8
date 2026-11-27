@@ -1,6 +1,7 @@
 """Orchestration layer used by both the CLI scripts and the local web UI."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +11,7 @@ from .config import (
     DATA_ROOT,
     DEFAULT_CONFIG,
     EXPERIMENTS_ROOT,
+    TARGET_CLASSES,
     Config,
 )
 from .cue import CueSheet
@@ -21,6 +23,7 @@ from .dataset import (
 )
 from .events import infer_recording
 from .evaluation import evaluate_recording, summarize, write_report
+from .labeling import AUDIT_STATUSES, set_audit_status
 from .model import SoundEventModel, build_metadata, train_models
 
 
@@ -99,7 +102,7 @@ class Pipeline:
         )
         metadata = build_metadata(train_recs, val_recs, arrays["x_train"])
         metadata["thresholds"] = dict(zip(
-            ["knock", "bell", "machine"], thresholds.round(4).tolist()
+            list(TARGET_CLASSES), thresholds.round(4).tolist()
         ))
         self.model = SoundEventModel(
             cfg=self.cfg,
@@ -118,10 +121,43 @@ class Pipeline:
         model = self.load_model()
         rec = self.get_recording(recording_id)
         result = infer_recording(model, rec)
+        result["annotations"] = rec.labels.get("events", [])
+        result["legacy_annotations"] = rec.labels.get("legacy_annotations", [])
         self._inference[recording_id] = result
         if recording_id not in self.cue_sheet.entries:
             self.cue_sheet.replace_from_events(recording_id, result["events"])
         return result
+
+    # ------------------------------------------------------------ auditing
+    def audit_event(self, recording_id: str, event_id: str,
+                    status: str, note: str | None = None) -> dict:
+        """Record the listening-review verdict for one annotated interval.
+
+        The change is written to labels.json and immediately constrains
+        training packing: only ``audited`` intervals keep contributing
+        positive windows; pending/unclaimed intervals are withheld.
+        """
+        if status not in AUDIT_STATUSES:
+            raise ValueError(f"unknown audit status {status!r}")
+        rec = self.get_recording(recording_id)
+        labels_path = rec.path / "labels.json"
+        updated = set_audit_status(rec.labels["events"], event_id, status, note)
+        labels_path.write_text(json.dumps(rec.labels, indent=2, ensure_ascii=False))
+        self._inference.pop(recording_id, None)
+        return updated
+
+    def annotation_summary(self, recording_id: str) -> dict:
+        rec = self.get_recording(recording_id)
+        from .labeling import events_by_audit, trainable_events
+
+        events = rec.labels.get("events", [])
+        buckets = events_by_audit(events)
+        return {
+            "recording_id": recording_id,
+            "audit_counts": {k: len(v) for k, v in buckets.items()},
+            "trainable_event_ids": [e["event_id"] for e in trainable_events(events)],
+            "legacy_annotations": rec.labels.get("legacy_annotations", []),
+        }
 
     def run_split_evaluation(self, split: str) -> dict:
         model = self.load_model()
@@ -168,21 +204,16 @@ class Pipeline:
             "mel_patch": np.asarray(patch, dtype=np.float32).tolist(),
             "class_probabilities": {
                 cls: round(float(p), 4)
-                for cls, p in zip(
-                    ["knock", "bell", "machine"],
-                    result["window_probs"][idx],
-                )
+                for cls, p in zip(TARGET_CLASSES, result["window_probs"][idx])
             },
             "thresholds": {
                 cls: round(float(t), 4)
-                for cls, t in zip(
-                    ["knock", "bell", "machine"], result["thresholds"]
-                )
+                for cls, t in zip(TARGET_CLASSES, result["thresholds"])
             },
             "decisions": {
                 cls: bool(p >= t)
                 for cls, p, t in zip(
-                    ["knock", "bell", "machine"],
+                    TARGET_CLASSES,
                     result["window_probs"][idx],
                     result["thresholds"],
                 )

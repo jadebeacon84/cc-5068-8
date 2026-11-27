@@ -47,6 +47,52 @@ def test_recording_contents_and_source_tracks(data_dir, tiny_config):
         assert (rec_dir / ev["source"]).exists()
         # source file names must not encode the class
         assert ev["class"] not in Path(ev["source"]).stem
+        assert ev["audit_status"] in (
+            "audited", "pending_review", "unclaimed")
+    assert "file_digests" in labels and labels["file_digests"]
+
+
+def test_legacy_bell_split_produces_overlapping_bell_and_chime(data_dir):
+    """Two time-overlapping examples share the old bell label across splits."""
+    found_classes = set()
+    overlap_recordings = 0
+    pending_seen = False
+    for split in ("train", "val"):
+        manifest = read_manifest(data_dir)
+        for rid in manifest[split]:
+            labels = json.loads(
+                (data_dir / split / rid / "labels.json").read_text())
+            legacy = labels.get("legacy_annotations", [])
+            if not legacy:
+                continue
+            scopes = {entry["scope"] for entry in legacy}
+            assert {"single_event", "whole_segment"}.issubset(scopes)
+            bells = [e for e in labels["events"] if e["class"] == "bell"]
+            chimes = [e for e in labels["events"] if e["class"] == "chime"]
+            assert bells and chimes
+            overlap = any(
+                min(b["end"], c["end"]) - max(b["start"], c["start"]) > 0
+                for b in bells for c in chimes)
+            assert overlap, "bell and chime must overlap in time"
+            found_classes |= {"bell", "chime"}
+            overlap_recordings += 1
+            if any(e.get("audit_status") == "pending_review"
+                   for e in labels["events"]):
+                pending_seen = True
+    assert overlap_recordings >= 2
+    assert found_classes == {"bell", "chime"}
+    assert pending_seen, "one legacy split must remain pending listening review"
+
+
+def test_chime_class_present_in_taxonomy_and_data(data_dir):
+    all_classes = set()
+    for split, ids in read_manifest(data_dir).items():
+        for rid in ids:
+            labels = json.loads(
+                (data_dir / split / rid / "labels.json").read_text())
+            all_classes |= {e["class"] for e in labels["events"]}
+    assert "chime" in TARGET_CLASSES
+    assert "chime" in all_classes
 
 
 def test_window_labels_and_patch_shapes(data_dir, tiny_config):

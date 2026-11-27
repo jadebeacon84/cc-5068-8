@@ -120,12 +120,12 @@ def assemble_events(frame_probs: np.ndarray, thresholds: np.ndarray,
                     continue
                 window_scores = window_probs[win_idx, c]
                 confidence = float(np.mean(window_scores))
-                # Event-level gate: a real event needs at least one strongly
-                # positive window and an average that clears the class
-                # threshold. This rejects long, weak frame-level excursions
-                # over background/unknown audio.
-                if (confidence < thresholds[c]
-                        or float(np.max(window_scores)) < thresholds[c]):
+                # Event-level gate: at least one strongly positive window must
+                # clear the class threshold. Averaging alone would starve
+                # short events (knock trains, prompt beeps) whose duration is
+                # below the 1 s analysis window, because background frames in
+                # the same overlapping windows would dilute their mean.
+                if float(np.max(window_scores)) < thresholds[c]:
                     continue
                 ev = SoundEvent(
                     event_uid=f"ev_{uid:04d}",

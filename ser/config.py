@@ -9,10 +9,28 @@ import dataclasses
 import json
 from pathlib import Path
 
-TARGET_CLASSES = ("knock", "bell", "machine")
+# Current taxonomy: the legacy shared label ``bell`` was split into the
+# mechanical bicycle bell (``bell``) and the electronic prompt tone (``chime``).
+TARGET_CLASSES = ("knock", "bell", "chime", "machine")
 BACKGROUND_CLASS = "background"
 UNKNOWN_CLASS = "unknown"
 ALL_EVENT_CLASSES = TARGET_CLASSES + (UNKNOWN_CLASS,)
+
+# Legacy taxonomy kept for mapping old annotations into the current classes.
+LEGACY_TARGET_CLASSES = ("knock", "bell", "machine")
+LEGACY_BELL_CLASS = "bell"
+
+# Audit states carried by every annotated interval.
+AUDIT_AUDITED = "audited"            # listening review passed; allowed in training
+AUDIT_PENDING = "pending_review"     # converted from a legacy label, not yet reviewed
+AUDIT_UNCLAIMED = "unclaimed"        # dry source track removed; identity cannot be claimed
+AUDIT_STATUSES = (AUDIT_AUDITED, AUDIT_PENDING, AUDIT_UNCLAIMED)
+
+# Legacy annotation granularity: one marker for a single event vs. one marker
+# covering a whole segment that may contain several events after the split.
+SCOPE_SINGLE = "single_event"
+SCOPE_SEGMENT = "whole_segment"
+LABEL_SCOPES = (SCOPE_SINGLE, SCOPE_SEGMENT)
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 WORKSPACE_ROOT = PACKAGE_ROOT.parent
@@ -32,7 +50,7 @@ class AudioConfig:
     fmax: float = 7500.0
     win_frames: int = 50           # 1.0 s model input window
     hop_frames: int = 10           # 200 ms window hop
-    min_label_overlap: float = 0.25  # min overlap (s) to tag a training window
+    min_label_overlap: float = 0.15  # min overlap (s) to tag a training window
     clip_seconds: float = 12.0
     frame_seconds: float = dataclasses.field(init=False)
     window_seconds: float = dataclasses.field(init=False)
@@ -64,6 +82,11 @@ class DatasetConfig:
     n_background_train: int = 6
     n_background_val: int = 3
     seed: int = 20261126
+    # Two recordings (one train, one val) carry a time-overlapping bell/chime
+    # pair that used to share the single legacy "bell" label.
+    legacy_overlap_indices: tuple[int, ...] = (0, 1)
+    quarantine_dirname: str = "sources_quarantined"
+    label_version: int = 2
 
 
 @dataclasses.dataclass(frozen=True)
@@ -91,7 +114,12 @@ def load_config(path: Path | None = None) -> Config:
 
     def filtered(cls, values):
         names = {f.name for f in dataclasses.fields(cls) if f.init}
-        return {k: v for k, v in values.items() if k in names}
+        out = {k: v for k, v in values.items() if k in names}
+        # tuple fields are serialized as JSON lists; restore their type.
+        for f in dataclasses.fields(cls):
+            if f.init and f.name in out and f.type == "tuple[int, ...]":
+                out[f.name] = tuple(out[f.name])
+        return out
 
     return Config(
         audio=AudioConfig(**filtered(AudioConfig, raw["audio"])),

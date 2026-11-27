@@ -13,6 +13,7 @@ room, and dense interference mixes containing unknown (rejectable) sounds.
 from __future__ import annotations
 
 import json
+import shutil
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,12 +22,23 @@ import numpy as np
 from scipy.signal import butter, lfilter
 
 from .audio import save_wav
-from .config import DatasetConfig
+from .config import (
+    AUDIT_AUDITED,
+    AUDIT_PENDING,
+    DatasetConfig,
+    SCOPE_SEGMENT,
+    SCOPE_SINGLE,
+)
+from .labeling import build_legacy_seed, recording_digests, sha256_file
 
 SR = 16000
 CLIP_SECONDS = 12.0
 
 CONDITIONS = ("clean_room", "room_reverb", "interference")
+
+# Fixed offsets keep split/condition assignment and RNG seeds deterministic
+# (no reliance on PYTHONHASHSEED).
+_SPLIT_OFFSETS = {"train": 0, "val": 1, "test": 2, "interference": 3}
 
 
 @dataclass
@@ -37,8 +49,11 @@ class ScheduledEvent:
     end: float
     source_file: str
     audio: np.ndarray
-    ring_count: int = 1          # >1: repeated rings of the same bell
+    ring_count: int = 1          # >1: repeated rings/beeps of the same source
     overlaps: list[str] = field(default_factory=list)
+    audit_status: str = AUDIT_AUDITED
+    identity_uncertain: bool = False
+    audit_note: str = ""
 
 
 def _bandpass_noise(rng: np.random.Generator, duration: float,
@@ -72,28 +87,29 @@ def _env_ar(n: int, attack_s: float, decay_s: float, sr: int) -> np.ndarray:
 
 
 def synth_knock(rng: np.random.Generator) -> tuple[np.ndarray, int]:
-    """A train of 2-5 impulsive knocks; returns (audio, ring_count)."""
-    n_pulses = int(rng.integers(2, 6))
-    gap = rng.uniform(0.07, 0.16)
+    """A train of 3-6 impulsive knocks; returns (audio, pulse_count)."""
+    n_pulses = int(rng.integers(3, 7))
+    gap = rng.uniform(0.09, 0.18)
     center = rng.uniform(700, 2400)
     pieces: list[np.ndarray] = []
     for i in range(n_pulses):
-        burst = _bandpass_noise(rng, 0.05, center * 0.6, center * 1.6)
-        burst *= _env_exp(len(burst), rng.uniform(0.008, 0.02), SR)
+        burst = _bandpass_noise(rng, 0.07, center * 0.6, center * 1.6)
+        burst *= _env_exp(len(burst), rng.uniform(0.012, 0.03), SR)
         pieces.append(burst)
         if i < n_pulses - 1:
             pieces.append(np.zeros(int(gap * SR), dtype=np.float32))
     audio = np.concatenate(pieces)
-    return audio / (np.max(np.abs(audio)) + 1e-9) * 0.8, n_pulses
+    return audio / (np.max(np.abs(audio)) + 1e-9) * 0.85, n_pulses
 
 
 def synth_bell(rng: np.random.Generator, rings: int = 1,
                ring_gap: float | None = None) -> np.ndarray:
     """Inharmonic partials with exponential decay; `rings` repeats of one bell."""
-    f0 = rng.uniform(350, 1400)
-    partials = np.array([1.0, 2.0, 2.76, 3.92, 5.43, 6.72])
-    decays = rng.uniform(0.25, 1.1, size=len(partials))
-    gains = np.array([1.0, 0.55, 0.35, 0.22, 0.14, 0.09], dtype=np.float32)
+    f0 = rng.uniform(300, 900)
+    partials = np.array([1.0, 2.0, 2.76, 3.92, 5.43, 6.72, 8.21])
+    decays = rng.uniform(0.35, 1.4, size=len(partials))
+    gains = np.array([1.0, 0.6, 0.42, 0.28, 0.18, 0.11, 0.06],
+                     dtype=np.float32)
     pieces: list[np.ndarray] = []
     gap = ring_gap if ring_gap is not None else rng.uniform(0.0, 0.25)
     for r in range(rings):
@@ -110,6 +126,44 @@ def synth_bell(rng: np.random.Generator, rings: int = 1,
             pieces.append(np.zeros(int(gap * SR), dtype=np.float32))
     audio = np.concatenate(pieces)
     return audio / (np.max(np.abs(audio)) + 1e-9) * 0.85
+
+
+def synth_chime(rng: np.random.Generator, beeps: int = 1,
+                beep_gap: float | None = None) -> tuple[np.ndarray, int]:
+    """Electronic prompt tone: stable harmonic beeps with a hard envelope.
+
+    Distinct from the inharmonic, exponentially decaying mechanical bell:
+    a strongly dominant fundamental, near-integer harmonics, near-instant
+    attack, flat sustain and an abrupt stop with regular on/off timing.
+    Returns (audio, beep_count).
+    """
+    f0 = rng.uniform(1200, 2600)
+    partials = np.array([1.0, 2.0, 3.0])
+    gains = np.array([1.0, 0.15, 0.04], dtype=np.float32)
+    pieces: list[np.ndarray] = []
+    gap = beep_gap if beep_gap is not None else rng.uniform(0.1, 0.2)
+    for _ in range(beeps):
+        dur = rng.uniform(0.22, 0.42)
+        n = int(dur * SR)
+        t = np.arange(n) / SR
+        sig = np.zeros(n, dtype=np.float32)
+        for p, g in zip(partials, gains):
+            # No per-partial random phase: stable phase gives the regular
+            # electronic timbre the classifier can separate from bells.
+            sig += (g * np.sin(2 * np.pi * f0 * p * t)).astype(np.float32)
+        # hard electronic envelope: 3 ms attack, flat sustain, 10 ms release
+        attack = int(0.003 * SR)
+        release = int(0.01 * SR)
+        env = np.ones(n, dtype=np.float32)
+        if attack:
+            env[:attack] = np.linspace(0, 1, attack)
+        if release:
+            env[-release:] = np.linspace(1, 0, release)
+        pieces.append(sig * env)
+        if len(pieces) < 2 * beeps - 1:
+            pieces.append(np.zeros(int(gap * SR), dtype=np.float32))
+    audio = np.concatenate(pieces)
+    return audio / (np.max(np.abs(audio)) + 1e-9) * 0.85, beeps
 
 
 def synth_machine(rng: np.random.Generator) -> np.ndarray:
@@ -167,13 +221,102 @@ def synthetic_rir(rng: np.random.Generator, rt60: float, sr: int = SR) -> np.nda
     return rir / np.max(np.abs(rir))
 
 
+def _place_legacy_overlap(rng: np.random.Generator,
+                          events: list[ScheduledEvent],
+                          pending: bool) -> tuple[ScheduledEvent, ScheduledEvent,
+                                                  list[dict]]:
+    """Force a time-overlapping bell/chime pair sharing the legacy ``bell`` label.
+
+    Returns the two scheduled events plus the legacy annotation spans: one
+    single-event span (the bell) and one whole-segment span covering both.
+    When ``pending`` is true the chime is left for listening review and the
+    whole-segment legacy span is explicitly unresolved.
+    """
+    def free_span(start: float, end: float, margin: float = 0.25) -> bool:
+        return all(end + margin <= e.start or start >= e.end + margin
+                   for e in events)
+
+    bell_audio = synth_bell(rng, rings=1)
+    bell_dur = len(bell_audio) / SR
+    # Only accept a strictly free slot; never fall back onto an occupied span.
+    start = None
+    for _ in range(120):
+        candidate = float(rng.uniform(0.3, CLIP_SECONDS - bell_dur - 0.3))
+        if free_span(candidate, candidate + bell_dur):
+            start = candidate
+            break
+    if start is None:
+        raise RuntimeError("no free slot for the legacy bell pair")
+    bell_id = uuid.uuid4().hex[:12]
+    bell = ScheduledEvent(
+        event_id=bell_id, cls="bell", start=round(start, 3),
+        end=round(start + bell_dur, 3),
+        source_file=f"sources/{bell_id}.wav",
+        audio=bell_audio.astype(np.float32), ring_count=1,
+    )
+    # The chime starts inside the bell's ringing tail: genuinely overlapping.
+    chime_audio, n_beeps = synth_chime(rng, beeps=2)
+    chime_dur = len(chime_audio) / SR
+
+    def blocked_by_other(s: float) -> bool:
+        e = s + chime_dur
+        return any(
+            other.event_id != bell.event_id
+            and min(e, other.end) - max(s, other.start) > 0
+            for other in events)
+
+    chime_start = None
+    for _ in range(120):
+        candidate = max(0.2, min(
+            bell.end - rng.uniform(0.2, min(0.6, chime_dur)),
+            CLIP_SECONDS - chime_dur - 0.2,
+        ))
+        if not blocked_by_other(candidate):
+            chime_start = candidate
+            break
+    if chime_start is None:
+        raise RuntimeError("no free slot for the legacy chime")
+    chime_id = uuid.uuid4().hex[:12]
+    chime = ScheduledEvent(
+        event_id=chime_id, cls="chime", start=round(chime_start, 3),
+        end=round(chime_start + chime_dur, 3),
+        source_file=f"sources/{chime_id}.wav",
+        audio=chime_audio.astype(np.float32), ring_count=n_beeps,
+        audit_status=AUDIT_PENDING if pending else AUDIT_AUDITED,
+        identity_uncertain=pending,
+        audit_note=("legacy bell split; awaiting listening review"
+                    if pending else ""),
+    )
+    bell.overlaps.append(chime_id)
+    chime.overlaps.append(bell_id)
+    legacy = [
+        build_legacy_seed(
+            "bell", bell.start, bell.end, SCOPE_SINGLE,
+            f"leg_single_{bell_id[:8]}",
+            note="legacy single-event marker for the bicycle bell",
+        ),
+        build_legacy_seed(
+            "bell", min(bell.start, chime.start),
+            max(bell.end, chime.end), SCOPE_SEGMENT,
+            f"leg_segment_{bell_id[:8]}",
+            note=("whole-segment marker covering bell + chime; "
+                  + ("unresolved split" if pending else "split confirmed by review")),
+        ),
+    ]
+    return bell, chime, legacy
+
+
 def _schedule_events(rng: np.random.Generator, condition: str,
-                     background_only: bool = False) -> list[ScheduledEvent]:
+                     background_only: bool = False,
+                     force_legacy_overlap: bool = False,
+                     legacy_pending: bool = False
+                     ) -> tuple[list[ScheduledEvent], list[dict]]:
     if background_only:
-        return []
-    n_target = {"clean_room": 3, "room_reverb": 4, "interference": 5}[condition]
-    n_unknown = {"clean_room": 1, "room_reverb": 2, "interference": 3}[condition]
+        return [], []
+    n_target = {"clean_room": 4, "room_reverb": 4, "interference": 4}[condition]
+    n_unknown = {"clean_room": 1, "room_reverb": 2, "interference": 2}[condition]
     events: list[ScheduledEvent] = []
+    legacy_entries: list[dict] = []
     cursor = 0.5
 
     def free_span(start: float, end: float, margin: float = 0.25) -> bool:
@@ -189,15 +332,31 @@ def _schedule_events(rng: np.random.Generator, condition: str,
         cursor = min(CLIP_SECONDS - duration - 0.2, cursor + duration + 0.4)
         return start
 
-    target_classes = ["knock", "bell", "machine"]
+    # The forced legacy pair is inserted last (after targets and unknowns), so
+    # no unrelated interval can ever land inside its legacy marker spans.
+    if force_legacy_overlap:
+        n_target -= 2
+
+    # Rotation guarantees every current class (including the new chime) is
+    # represented across the first scheduled target slots. After one full
+    # rotation, prompt tones are favored so the newly split class has enough
+    # audited positive windows despite pending items being withheld.
+    target_classes = ["knock", "bell", "chime", "machine"]
     for i in range(n_target):
-        cls = target_classes[i % 3] if i < 3 else str(rng.choice(target_classes))
+        if i < len(target_classes):
+            cls = target_classes[i % len(target_classes)]
+        else:
+            cls = str(rng.choice(
+                ["chime", "chime", "chime", "bell", "knock", "machine"]))
         eid = uuid.uuid4().hex[:12]
         rings = 1
         if cls == "knock":
             audio, _ = synth_knock(rng)
         elif cls == "machine":
             audio = synth_machine(rng)
+        elif cls == "chime":
+            beeps = 2 if rng.random() < 0.5 else 1
+            audio, rings = synth_chime(rng, beeps=beeps)
         else:
             # 40% of bells ring twice; same bell (ring_count=2) unless split below
             rings = 2 if rng.random() < 0.4 else 1
@@ -242,8 +401,14 @@ def _schedule_events(rng: np.random.Generator, condition: str,
             end=round(start + duration, 3),
             source_file=f"sources/{eid}.wav", audio=audio.astype(np.float32),
         ))
+
+    if force_legacy_overlap:
+        bell, chime, legacy = _place_legacy_overlap(rng, events, legacy_pending)
+        events.extend([bell, chime])
+        legacy_entries.extend(legacy)
+
     events.sort(key=lambda e: e.start)
-    return events
+    return events, legacy_entries
 
 
 def _render_event(ev: ScheduledEvent) -> np.ndarray:
@@ -251,11 +416,25 @@ def _render_event(ev: ScheduledEvent) -> np.ndarray:
 
 
 def synthesize_recording(out_dir: Path, condition: str, index: int,
-                         seed: int, background_only: bool = False) -> dict:
-    rng = np.random.default_rng(seed + index * 7919)
+                         seed: int, background_only: bool = False,
+                         force_legacy_overlap: bool = False,
+                         legacy_pending: bool = False) -> dict:
     out_dir = Path(out_dir)
     (out_dir / "sources").mkdir(parents=True, exist_ok=True)
-    schedule = _schedule_events(rng, condition, background_only)
+    schedule, legacy_entries = [], []
+    for attempt in range(8):
+        attempt_rng = np.random.default_rng(seed + index * 7919 + attempt * 101)
+        try:
+            schedule, legacy_entries = _schedule_events(
+                attempt_rng, condition, background_only,
+                force_legacy_overlap=force_legacy_overlap,
+                legacy_pending=legacy_pending,
+            )
+            break
+        except RuntimeError:
+            if attempt == 7:
+                raise
+    rng = np.random.default_rng(seed + index * 7919)
 
     noise_level = {"clean_room": 0.015, "room_reverb": 0.04, "interference": 0.09}[condition]
     rt60 = {"clean_room": 0.08, "room_reverb": 0.45, "interference": 0.35}[condition]
@@ -283,6 +462,9 @@ def synthesize_recording(out_dir: Path, condition: str, index: int,
             "source": ev.source_file,
             "ring_count": ev.ring_count,
             "overlaps": ev.overlaps,
+            "audit_status": ev.audit_status,
+            "identity_uncertain": ev.identity_uncertain,
+            "audit_note": ev.audit_note,
         })
 
     noise = _pinkish_noise(rng, CLIP_SECONDS) * noise_level
@@ -308,6 +490,8 @@ def synthesize_recording(out_dir: Path, condition: str, index: int,
             "noise_level": noise_level,
         },
         "events": labels_events,
+        "legacy_annotations": legacy_entries,
+        "file_digests": recording_digests(out_dir),
     }
     (out_dir / "labels.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False))
     return meta
@@ -316,6 +500,13 @@ def synthesize_recording(out_dir: Path, condition: str, index: int,
 def build_dataset(root: Path, cfg: DatasetConfig) -> dict:
     """Generate train/val/test/interference splits as disjoint recordings."""
     root = Path(root)
+    # Remove recordings left by earlier generations so a rebuild cannot leave
+    # stale directories that are absent from the new manifest. Runtime files at
+    # the root (cue sheet, feedback, config snapshot) are left untouched.
+    for split in ("train", "val", "test", "interference"):
+        split_dir = root / split
+        if split_dir.exists():
+            shutil.rmtree(split_dir)
     plan = {
         "train": cfg.n_train,
         "val": cfg.n_val,
@@ -325,13 +516,23 @@ def build_dataset(root: Path, cfg: DatasetConfig) -> dict:
     manifest: dict[str, list[str]] = {}
     for split, count in plan.items():
         ids = []
+        split_seed = cfg.seed + _SPLIT_OFFSETS[split] * 100003
         for i in range(count):
             # Recording conditions are distributed across splits, but each
             # recording exists in exactly one split (no slice-level leakage).
-            condition = CONDITIONS[(i + hash(split)) % len(CONDITIONS)]
+            condition = CONDITIONS[(i + _SPLIT_OFFSETS[split]) % len(CONDITIONS)]
             rec_id = f"{split[:2]}_{uuid.uuid4().hex[:10]}"
-            synthesize_recording(root / split / rec_id, condition, i,
-                                 cfg.seed + hash(split) % 100000)
+            # First two indexed slots carry the forced overlapping bell/chime
+            # pair inherited from the shared legacy label. The val copy keeps
+            # its prompt tone pending listening review; the train copy is
+            # already audited.
+            force_overlap = i in cfg.legacy_overlap_indices
+            pending = force_overlap and split == "val"
+            synthesize_recording(
+                root / split / rec_id, condition, i, split_seed,
+                force_legacy_overlap=force_overlap,
+                legacy_pending=pending,
+            )
             ids.append(rec_id)
 
         # Pure-background recordings teach rejection. They live only in
@@ -344,7 +545,7 @@ def build_dataset(root: Path, cfg: DatasetConfig) -> dict:
             synthesize_recording(
                 root / split / rec_id, condition,
                 index=1000 + i,
-                seed=cfg.seed + hash(split) % 100000,
+                seed=split_seed,
                 background_only=True,
             )
             ids.append(rec_id)

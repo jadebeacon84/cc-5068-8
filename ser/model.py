@@ -35,12 +35,16 @@ def _precision_recall_f1(probs: np.ndarray, labels: np.ndarray,
 
 def calibrate_thresholds(probs: np.ndarray, labels: np.ndarray,
                          default: float = 0.5,
-                         precision_floor: float = 0.85) -> np.ndarray:
+                         precision_floor: float = 0.55) -> np.ndarray:
     """Pick the F1-best threshold subject to a precision floor.
 
     Unknown and background windows are all-zero negatives; the precision floor
-    prevents those from being absorbed into a target class for the sake of
-    recall. If no threshold reaches the floor, take the highest-precision one.
+    still prevents them from being absorbed wholesale into a target class. The
+    floor is deliberately moderate because a newly split class with few
+    positive windows cannot reach a very high precision at any threshold that
+    also retains recall; demanding more would push calibration onto a degenerate
+    extreme threshold. Ties on F1 resolve toward higher recall. If no threshold
+    reaches the floor, take the highest-precision one.
     """
     thresholds = np.full(labels.shape[1], default, dtype=np.float32)
     grid = np.linspace(0.05, 0.95, 91)
@@ -53,7 +57,8 @@ def calibrate_thresholds(probs: np.ndarray, labels: np.ndarray,
         ]
         feasible = [row for row in scored if row[1] >= precision_floor]
         if feasible:
-            best = max(feasible, key=lambda row: row[3])
+            # row = (threshold, precision, recall, f1)
+            best = max(feasible, key=lambda row: (row[3], row[2]))
         else:
             best = max(scored, key=lambda row: (row[1], row[3]))
         thresholds[c] = best[0]

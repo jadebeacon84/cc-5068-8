@@ -8,6 +8,8 @@ const state = {
   inference: null,
   frameProbs: null,
   cueEntries: [],
+  annotations: [],
+  legacyAnnotations: [],
   cuts: [],
   selectedUid: null,
   selectedWindow: null,
@@ -17,9 +19,16 @@ const state = {
 const CLASS_COLORS = {
   knock: "#e07a5f",
   bell: "#81b29a",
+  chime: "#f2cc8f",
   machine: "#5c7cfa",
   unknown: "#9d9d9d",
   background: "#cccccc",
+};
+
+const AUDIT_LABELS = {
+  audited: "试听审定",
+  pending_review: "待审定",
+  unclaimed: "待认领（分轨移走）",
 };
 
 async function api(path, options) {
@@ -156,6 +165,21 @@ async function openRecording(recordingId) {
       </section>
     </div>
     <section class="panel">
+      <h3>标注资料与试听审定（决定样本是否进入训练）</h3>
+      <div class="toolbar">
+        <button id="btn-annotations">刷新审定状态</button>
+        <span class="hint">仅“试听审定”且分轨在位的区间进入单类训练；待审定/待认领区间被排除。</span>
+      </div>
+      <table class="cue-table">
+        <thead><tr>
+          <th>事件ID</th><th>标签</th><th>发生位置</th><th>时长</th>
+          <th>审定状态</th><th>身份</th><th>试听操作</th>
+        </tr></thead>
+        <tbody id="annotation-body"></tbody>
+      </table>
+      <div id="legacy-box" class="verify-box muted">旧标签映射加载中…</div>
+    </section>
+    <section class="panel">
       <h3>帧级概率与分析窗网格</h3>
       <canvas id="probs" width="1100" height="160"></canvas>
       <div class="legend" id="prob-legend"></div>
@@ -169,12 +193,15 @@ async function openRecording(recordingId) {
     state.inference = await postJson(
       `/api/recordings/${recordingId}/inference?force=1`);
     state.cueEntries = state.inference.cue_entries;
+    state.annotations = state.inference.annotations || [];
+    state.legacyAnnotations = state.inference.legacy_annotations || [];
     await loadFrameProbs();
     renderAll();
   };
   document.getElementById("btn-verify").onclick = runVerify;
   document.getElementById("btn-cut").onclick = runCut;
   document.getElementById("btn-restore").onclick = runRestore;
+  document.getElementById("btn-annotations").onclick = refreshAnnotations;
 
   state.audioEl = document.getElementById("audio");
   state.waveform = await api(
@@ -182,6 +209,8 @@ async function openRecording(recordingId) {
   state.inference = await api(
     `/api/recordings/${recordingId}/inference`);
   state.cueEntries = state.inference.cue_entries;
+  state.annotations = state.inference.annotations || [];
+  state.legacyAnnotations = state.inference.legacy_annotations || [];
   const cue = await api(`/api/cuesheet/${recordingId}`);
   state.cuts = cue.cuts;
   await loadFrameProbs();
@@ -203,6 +232,7 @@ function renderAll() {
   drawEvents();
   drawProbs();
   renderCueTable();
+  renderAnnotations();
   renderLegend();
   bindCanvasClicks();
 }
@@ -302,6 +332,75 @@ function renderLegend() {
   el.innerHTML = window.TARGET_CLASSES.map(
     c => `<span class="chip" style="background:${CLASS_COLORS[c]}">${c}</span>`
   ).join("") + `<span class="hint">虚线为该类校准阈值；阴影为当前证据窗</span>`;
+}
+
+function renderAnnotations() {
+  const body = document.getElementById("annotation-body");
+  if (!body) return;
+  body.innerHTML = "";
+  const rows = state.annotations.filter(a =>
+    window.TARGET_CLASSES.includes(a.cls));
+  for (const row of rows) {
+    const tr = document.createElement("tr");
+    const status = row.audit_status || "pending_review";
+    if (status !== "audited") tr.className = "annotation-held";
+    const identity = row.identity_uncertain
+      ? "身份不确定"
+      : (row.source_event_id || row.source || "—");
+    tr.innerHTML = `
+      <td>${row.event_id.slice(0, 10)}</td>
+      <td><span class="chip" style="background:${CLASS_COLORS[row.cls]}">${row.cls}</span>
+        ${row.ring_count > 1 ? "×" + row.ring_count : ""}</td>
+      <td>${fmt(row.start)} – ${fmt(row.end)}</td>
+      <td>${(row.end - row.start).toFixed(2)}s</td>
+      <td>${AUDIT_LABELS[status] || status}</td>
+      <td>${identity}</td>
+      <td class="row-actions">
+        <button class="ann-play">试听</button>
+        <button class="ann-approve" ${status === "audited" ? "disabled" : ""}>审定通过</button>
+        <button class="ann-hold" ${status === "pending_review" ? "disabled" : ""}>置为待审定</button>
+      </td>`;
+    tr.querySelector(".ann-play").onclick = () => {
+      state.audioEl.currentTime = row.start;
+      state.audioEl.play();
+      setTimeout(() => state.audioEl.pause(),
+        (row.end - row.start) * 1000 + 100);
+    };
+    tr.querySelector(".ann-approve").onclick = () =>
+      submitAudit(row.event_id, "audited");
+    tr.querySelector(".ann-hold").onclick = () =>
+      submitAudit(row.event_id, "pending_review",
+        "operator returned interval to listening review");
+    body.appendChild(tr);
+  }
+  const legacyBox = document.getElementById("legacy-box");
+  if (legacyBox) {
+    if (!state.legacyAnnotations.length) {
+      legacyBox.textContent = "该录音无旧标签迁移记录。";
+    } else {
+      legacyBox.classList.remove("muted");
+      legacyBox.innerHTML = state.legacyAnnotations.map(g => `
+        <div>旧标签 <strong>${g.legacy_class}</strong>
+          （${g.scope === "whole_segment" ? "整段" : "单次事件"}）
+          ${fmt(g.start)} – ${fmt(g.end)} →
+          候选新类：${g.candidate_classes.join(" / ")}
+          ${g.note ? "｜" + g.note : ""}</div>`).join("");
+    }
+  }
+}
+
+async function submitAudit(eventId, status, note) {
+  await postJson(`/api/recordings/${state.current}/audit`, {
+    event_id: eventId, status, note: note || null,
+  });
+  await refreshAnnotations();
+}
+
+async function refreshAnnotations() {
+  const inf = await api(`/api/recordings/${state.current}/inference`);
+  state.annotations = inf.annotations || [];
+  state.legacyAnnotations = inf.legacy_annotations || [];
+  renderAnnotations();
 }
 
 function renderCueTable() {
